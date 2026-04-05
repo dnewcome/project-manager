@@ -63,7 +63,6 @@ proj show mmt8
 ```
 Name:        mmt8
 Slug:        mmt8
-Path:        /home/dan/sandbox/dnewcome/mmt8
 Last commit: 1w ago
 Description: Reverse engineering and porting of the Alesis MMT-8 MIDI sequencer firmware
 Tags:        embedded, 8051, reverse-engineering, MIDI, C, firmware, Ghidra
@@ -94,7 +93,7 @@ proj tags
 
 ## Configuration
 
-`proj` looks for projects in `~/sandbox/dnewcome/`. To change this, edit the `SANDBOX` variable at the top of the script.
+Edit the `SANDBOX` variable at the top of the script to point at your projects directory.
 
 
 ## .project.toml
