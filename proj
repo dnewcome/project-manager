@@ -3,9 +3,11 @@
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tomllib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -78,15 +80,61 @@ def fmt_tags(tags: list) -> str:
     return " ".join(f"[{t}]" for t in tags) if tags else ""
 
 
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")
+
+
+def split_toml_sections(raw: str) -> tuple[str, str]:
+    """Split raw TOML into (scalar header, table sections).
+    Everything from the first [section] or [[section]] line onwards is preserved verbatim."""
+    for i, line in enumerate(raw.splitlines()):
+        if re.match(r"^\[", line):
+            header = "\n".join(raw.splitlines()[:i]).rstrip()
+            sections = "\n".join(raw.splitlines()[i:])
+            return header, sections
+    return raw.rstrip(), ""
+
+
+def build_header(proj_id: str, slug: str, name: str, description: str, tags: list[str]) -> str:
+    lines = [
+        f'id = "{proj_id}"',
+        f'slug = "{slug}"',
+        f'name = "{name}"',
+    ]
+    if description:
+        lines.append(f'description = "{description}"')
+    if tags:
+        tag_str = ", ".join(f'"{t}"' for t in tags)
+        lines.append(f"tags = [{tag_str}]")
+    return "\n".join(lines)
+
+
+def prompt(label: str, default: str = "") -> str:
+    """Prompt only when running in a TTY."""
+    if not sys.stdin.isatty():
+        return default
+    suffix = f" [{default}]" if default else ""
+    val = input(f"{label}{suffix}: ").strip()
+    return val or default
+
+
+def resolve_project_dir(project_arg: str | None) -> Path:
+    if project_arg:
+        d = SANDBOX / project_arg
+        if not d.exists():
+            print(f"Project not found: {project_arg}", file=sys.stderr)
+            sys.exit(1)
+        return d
+    return Path.cwd()
+
+
 def cmd_list(args):
     projects = load_all_projects()
 
-    # filter by tag
     if args.tag:
         tag_lower = args.tag.lower()
         projects = [p for p in projects if any(tag_lower in t.lower() for t in p["tags"])]
 
-    # filter to only projects with recent activity
     if args.recent:
         projects = [p for p in projects if p["last_commit"] is not None]
         projects.sort(key=lambda p: p["last_commit"], reverse=True)
@@ -101,18 +149,16 @@ def cmd_list(args):
         print("No projects found.")
         return
 
-    # column widths
     name_w = max(len(p["name"]) for p in projects)
     age_w = max(len(fmt_age(p["last_commit"])) for p in projects)
 
     for p in projects:
         age = fmt_age(p["last_commit"])
         tags = fmt_tags(p["tags"])
-        desc = p["description"]
         toml_marker = "" if p["has_toml"] else " *"
         print(f"{p['name']:<{name_w}}{toml_marker}  {age:<{age_w}}  {tags}")
-        if args.verbose and desc:
-            print(f"  {'':>{name_w}}  {desc}")
+        if args.verbose and p["description"]:
+            print(f"  {'':>{name_w}}  {p['description']}")
 
 
 def cmd_show(args):
@@ -127,12 +173,61 @@ def cmd_show(args):
     print(f"Last commit: {fmt_age(p['last_commit'])}")
     if p["description"]:
         print(f"Description: {p['description']}")
-    if p["tags"]:
-        print(f"Tags:        {', '.join(p['tags'])}")
-    else:
-        print("Tags:        (none)")
+    print(f"Tags:        {', '.join(p['tags']) if p['tags'] else '(none)'}")
     if not p["has_toml"]:
         print("Note:        no .project.toml")
+
+
+def cmd_init(args):
+    project_dir = resolve_project_dir(args.project)
+    toml_path = project_dir / ".project.toml"
+
+    existing = {}
+    raw = ""
+    if toml_path.exists():
+        raw = toml_path.read_text()
+        with open(toml_path, "rb") as f:
+            try:
+                existing = tomllib.load(f)
+            except Exception as e:
+                print(f"Warning: could not parse existing .project.toml: {e}", file=sys.stderr)
+
+    # Stable id — never overwrite if already set
+    proj_id = existing.get("id") or str(uuid.uuid4())
+
+    # Slug: flag > existing > infer from dir name
+    slug = args.slug or existing.get("slug") or slugify(project_dir.name)
+
+    # Name: flag > existing > prompt > dir name
+    name = args.name or existing.get("name") or prompt("Name", project_dir.name)
+
+    # Description: flag > existing > prompt
+    description = args.description or existing.get("description") or prompt("Description")
+
+    # Tags: merge existing + any new ones from flag
+    tags = list(existing.get("tags", []))
+    if args.tags:
+        for t in args.tags:
+            if t not in tags:
+                tags.append(t)
+
+    # Preserve any table sections from the existing file
+    _, sections = split_toml_sections(raw)
+
+    header = build_header(proj_id, slug, name, description, tags)
+    content = header + ("\n\n" + sections if sections else "") + "\n"
+
+    toml_path.write_text(content)
+
+    action = "Updated" if existing else "Created"
+    print(f"{action} {toml_path}")
+    print(f"  id:          {proj_id}")
+    print(f"  slug:        {slug}")
+    print(f"  name:        {name}")
+    if description:
+        print(f"  description: {description}")
+    if tags:
+        print(f"  tags:        {', '.join(tags)}")
 
 
 def cmd_tag(args):
@@ -143,7 +238,6 @@ def cmd_tag(args):
 
     toml_path = project_dir / ".project.toml"
 
-    # read raw text to preserve formatting
     if toml_path.exists():
         raw = toml_path.read_text()
         with open(toml_path, "rb") as f:
@@ -161,14 +255,11 @@ def cmd_tag(args):
 
     updated_tags = current_tags + new_tags
     tag_str = ", ".join(f'"{t}"' for t in updated_tags)
-    new_line = f'tags = [{tag_str}]'
+    new_line = f"tags = [{tag_str}]"
 
     if "tags" in data:
-        # replace existing tags line
-        import re
-        raw = re.sub(r'^tags\s*=\s*\[.*?\]$', new_line, raw, flags=re.MULTILINE)
+        raw = re.sub(r"^tags\s*=\s*\[.*?\]$", new_line, raw, flags=re.MULTILINE)
     else:
-        # append after name/slug/description block if present, else at top
         if raw and not raw.endswith("\n"):
             raw += "\n"
         raw += new_line + "\n"
@@ -195,9 +286,18 @@ def cmd_tags(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="proj",
-        description="Browse and tag projects in ~/sandbox/dnewcome/"
+        description="Browse and manage projects in ~/sandbox/dnewcome/"
     )
     sub = parser.add_subparsers(dest="command")
+
+    # init
+    init_p = sub.add_parser("init", help="Create or update .project.toml")
+    init_p.add_argument("project", nargs="?",
+                        help="Project name (default: current directory)")
+    init_p.add_argument("--name", help="Project name")
+    init_p.add_argument("--slug", help="URL-safe slug (default: inferred from directory name)")
+    init_p.add_argument("--description", "-d", help="One-line description")
+    init_p.add_argument("--tags", "-t", nargs="+", help="Initial tags")
 
     # list
     ls_p = sub.add_parser("ls", help="List projects")
@@ -216,12 +316,14 @@ def main():
     tag_p.add_argument("project", help="Project slug/directory name")
     tag_p.add_argument("tags", nargs="+", help="Tags to add")
 
-    # tags (list all tags)
+    # tags
     sub.add_parser("tags", help="List all tags and counts")
 
     args = parser.parse_args()
 
-    if args.command == "ls":
+    if args.command == "init":
+        cmd_init(args)
+    elif args.command == "ls":
         cmd_list(args)
     elif args.command == "show":
         cmd_show(args)
