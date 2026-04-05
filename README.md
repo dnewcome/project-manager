@@ -25,13 +25,13 @@ A `*` means the project has no `.project.toml` yet. Sorted by last git commit.
 ## Install
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/dnewcome/techno-forge/main/project-manager/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dnewcome/project-manager/main/install.sh)
 ```
 
 Or from source:
 
 ```sh
-bash project-manager/install.sh
+bash install.sh
 ```
 
 Requires Python 3.11+. No dependencies beyond the standard library.

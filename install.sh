@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-REPO="https://github.com/dnewcome/techno-forge"
+REPO="https://github.com/dnewcome/project-manager"
 TAG="main"
 INSTALL_DIR="$HOME/.local/bin"
 
@@ -56,7 +56,7 @@ else
   echo "  Fetching $TARBALL_URL..."
   curl -fsSL "$TARBALL_URL" | tar xz -C "$TMP"
   SRC=$(ls "$TMP")
-  cp "$TMP/$SRC/project-manager/proj" "$INSTALL_DIR/proj"
+  cp "$TMP/$SRC/proj" "$INSTALL_DIR/proj"
 fi
 
 chmod +x "$INSTALL_DIR/proj"
