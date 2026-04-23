@@ -14,11 +14,13 @@ set -euo pipefail
 REPO="https://github.com/dnewcome/project-manager"
 TAG="main"
 INSTALL_DIR="$HOME/.local/bin"
+LINK=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tag) TAG="$2"; shift 2 ;;
     --dir) INSTALL_DIR="$2"; shift 2 ;;
+    --link) LINK=1; shift ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
@@ -37,12 +39,23 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
-# If running from the local repo, copy directly
+# If running from the local repo, copy or symlink directly
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/proj" ]]; then
-  echo "Installing proj from local source..."
-  cp "$SCRIPT_DIR/proj" "$INSTALL_DIR/proj"
+  chmod +x "$SCRIPT_DIR/proj"
+  if (( LINK )); then
+    echo "Linking proj from local source..."
+    ln -sfn "$SCRIPT_DIR/proj" "$INSTALL_DIR/proj"
+  else
+    echo "Installing proj from local source..."
+    cp "$SCRIPT_DIR/proj" "$INSTALL_DIR/proj"
+    chmod +x "$INSTALL_DIR/proj"
+  fi
 else
+  if (( LINK )); then
+    echo "Error: --link requires running install.sh from a local checkout" >&2
+    exit 1
+  fi
   echo "Installing proj@${TAG} from GitHub..."
   TMP=$(mktemp -d)
   trap 'rm -rf "$TMP"' EXIT
@@ -57,9 +70,9 @@ else
   curl -fsSL "$TARBALL_URL" | tar xz -C "$TMP"
   SRC=$(ls "$TMP")
   cp "$TMP/$SRC/proj" "$INSTALL_DIR/proj"
+  chmod +x "$INSTALL_DIR/proj"
 fi
 
-chmod +x "$INSTALL_DIR/proj"
 echo "  Installed $INSTALL_DIR/proj"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then

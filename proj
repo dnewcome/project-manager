@@ -2,10 +2,12 @@
 """proj — browse and tag projects in ~/sandbox/dnewcome/"""
 
 import argparse
+import curses
 import os
 import re
 import subprocess
 import sys
+import textwrap
 import tomllib
 import uuid
 from datetime import datetime, timezone
@@ -129,6 +131,10 @@ def resolve_project_dir(project_arg: str | None) -> Path:
 
 
 def cmd_list(args):
+    if args.interactive:
+        run_tui()
+        return
+
     projects = load_all_projects()
 
     if args.tag:
@@ -283,6 +289,322 @@ def cmd_tags(args):
         print(f"{count:3}  {tag}")
 
 
+# ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+
+def _safe_addstr(win, y, x, s, attr=0):
+    try:
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        s = s[: max(0, w - x)]
+        win.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+def _prompt(stdscr, prefix: str) -> str:
+    h, w = stdscr.getmaxyx()
+    curses.curs_set(1)
+    curses.echo()
+    _safe_addstr(stdscr, h - 1, 0, " " * (w - 1))
+    _safe_addstr(stdscr, h - 1, 0, prefix)
+    try:
+        raw = stdscr.getstr(h - 1, len(prefix), max(1, w - len(prefix) - 1))
+    except KeyboardInterrupt:
+        raw = b""
+    curses.noecho()
+    curses.curs_set(0)
+    return raw.decode("utf-8", errors="replace").strip()
+
+
+def _suspend_shell(stdscr, path: str):
+    curses.def_prog_mode()
+    curses.endwin()
+    shell = os.environ.get("SHELL", "/bin/bash")
+    try:
+        subprocess.run([shell], cwd=path)
+    except Exception:
+        pass
+    curses.reset_prog_mode()
+    stdscr.clear()
+    stdscr.refresh()
+
+
+def _load_commits(project_dir: Path, n: int = 8) -> list[tuple[str, str]]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_dir), "log", f"-{n}", "--format=%h %s"],
+            capture_output=True, text=True, timeout=5
+        )
+        out = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(" ", 1)
+            if len(parts) == 2:
+                out.append((parts[0], parts[1]))
+            elif parts and parts[0]:
+                out.append((parts[0], ""))
+        return out
+    except Exception:
+        return []
+
+
+def _tui_add_tag(project_dir: Path, new_tags: list[str]) -> bool:
+    """Silent variant of cmd_tag. Returns True if file changed."""
+    toml_path = project_dir / ".project.toml"
+    if toml_path.exists():
+        raw = toml_path.read_text()
+        with open(toml_path, "rb") as f:
+            try:
+                data = tomllib.load(f)
+            except Exception:
+                return False
+    else:
+        raw = ""
+        data = {}
+
+    current = list(data.get("tags", []))
+    merged = list(current)
+    for t in new_tags:
+        if t and t not in merged:
+            merged.append(t)
+    if merged == current:
+        return False
+
+    tag_str = ", ".join(f'"{t}"' for t in merged)
+    new_line = f"tags = [{tag_str}]"
+    if "tags" in data:
+        raw = re.sub(r"^tags\s*=\s*\[.*?\]$", new_line, raw, flags=re.MULTILINE)
+    else:
+        if raw and not raw.endswith("\n"):
+            raw += "\n"
+        raw += new_line + "\n"
+    toml_path.write_text(raw)
+    return True
+
+
+def _tui_main(stdscr, projects):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    if curses.has_colors():
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = curses.COLOR_BLACK
+        curses.init_pair(1, curses.COLOR_CYAN, bg)
+        curses.init_pair(2, curses.COLOR_YELLOW, bg)
+        curses.init_pair(3, curses.COLOR_GREEN, bg)
+        curses.init_pair(4, curses.COLOR_MAGENTA, bg)
+
+    sel_attr = curses.A_REVERSE
+    tag_attr = curses.color_pair(2)
+    age_attr = curses.color_pair(3)
+    notoml_attr = curses.color_pair(4)
+    hdr_attr = curses.A_REVERSE
+
+    commit_cache: dict[Path, list[tuple[str, str]]] = {}
+
+    state = {
+        "sort": "recent",
+        "filter": "",
+        "cursor": 0,
+        "scroll": 0,
+        "message": "",
+    }
+
+    def apply():
+        items = list(projects)
+        if state["filter"]:
+            f = state["filter"].lower()
+            items = [
+                p for p in items
+                if f in p["name"].lower()
+                or f in p["slug"].lower()
+                or f in (p["description"] or "").lower()
+                or any(f in t.lower() for t in p["tags"])
+            ]
+        if state["sort"] == "recent":
+            items.sort(
+                key=lambda p: p["last_commit"] or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+        elif state["sort"] == "name":
+            items.sort(key=lambda p: p["name"].lower())
+        return items
+
+    while True:
+        items = apply()
+        if not items:
+            state["cursor"] = 0
+        else:
+            state["cursor"] = max(0, min(state["cursor"], len(items) - 1))
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        left_w = max(24, min(50, w // 2))
+        right_x = left_w + 1
+        rw = max(1, w - right_x)
+        body_top = 1
+        body_bot = h - 1  # exclusive
+        body_h = max(1, body_bot - body_top)
+
+        # Header
+        hdr = f" proj · {len(items)}/{len(projects)} · sort:{state['sort']}"
+        if state["filter"]:
+            hdr += f" · /{state['filter']}"
+        _safe_addstr(stdscr, 0, 0, hdr.ljust(w), hdr_attr)
+
+        # Scroll window
+        if state["cursor"] < state["scroll"]:
+            state["scroll"] = state["cursor"]
+        elif state["cursor"] >= state["scroll"] + body_h:
+            state["scroll"] = state["cursor"] - body_h + 1
+
+        # Left pane
+        for i in range(body_h):
+            idx = state["scroll"] + i
+            if idx >= len(items):
+                break
+            p = items[idx]
+            y = body_top + i
+            is_sel = idx == state["cursor"]
+            marker = "*" if not p["has_toml"] else " "
+            age = fmt_age(p["last_commit"])
+            name = p["name"]
+            max_name = max(1, left_w - len(age) - 5)
+            if len(name) > max_name:
+                name = name[: max_name - 1] + "…"
+            line = f" {marker} {name:<{max_name}} {age}"
+            line = line[:left_w].ljust(left_w)
+            _safe_addstr(stdscr, y, 0, line, sel_attr if is_sel else 0)
+
+        # Separator
+        for y in range(body_top, body_bot):
+            _safe_addstr(stdscr, y, left_w, "│")
+
+        # Right pane
+        if items:
+            p = items[state["cursor"]]
+            r = body_top
+
+            def put(s: str, attr=0):
+                nonlocal r
+                if r >= body_bot:
+                    return
+                _safe_addstr(stdscr, r, right_x, s[:rw], attr)
+                r += 1
+
+            put(p["name"], curses.A_BOLD)
+            put(f"slug: {p['slug']}")
+            put(f"path: {p['path']}")
+            put(f"last: {fmt_age(p['last_commit'])}", age_attr)
+            r += 1
+
+            if p["description"]:
+                put("description:", curses.A_UNDERLINE)
+                for line in textwrap.wrap(p["description"], max(1, rw - 2)):
+                    put("  " + line)
+                r += 1
+
+            if p["tags"]:
+                put("tags: " + ", ".join(p["tags"]), tag_attr)
+            else:
+                put("tags: (none)")
+            r += 1
+
+            if not p["has_toml"]:
+                put("no .project.toml", notoml_attr)
+                r += 1
+
+            if r < body_bot - 1 and p["last_commit"] is not None:
+                if p["path"] not in commit_cache:
+                    commit_cache[p["path"]] = _load_commits(p["path"])
+                commits = commit_cache[p["path"]]
+                if commits:
+                    put("recent commits:", curses.A_UNDERLINE)
+                    for sha, subj in commits:
+                        put(f"  {sha} {subj}")
+        else:
+            _safe_addstr(stdscr, body_top, right_x, "(no projects match filter)")
+
+        # Status bar
+        if state["message"]:
+            status = " " + state["message"]
+        else:
+            status = " j/k move · g/G top/bot · / filter · s sort · t tag · ! shell · Enter cd · q quit"
+        _safe_addstr(stdscr, h - 1, 0, status.ljust(w), hdr_attr)
+        state["message"] = ""
+
+        stdscr.refresh()
+        ch = stdscr.getch()
+
+        if ch == ord("q"):
+            return None
+        elif ch in (ord("j"), curses.KEY_DOWN):
+            if items and state["cursor"] < len(items) - 1:
+                state["cursor"] += 1
+        elif ch in (ord("k"), curses.KEY_UP):
+            if state["cursor"] > 0:
+                state["cursor"] -= 1
+        elif ch == ord("g"):
+            state["cursor"] = 0
+        elif ch == ord("G"):
+            state["cursor"] = max(0, len(items) - 1)
+        elif ch in (curses.KEY_NPAGE, 6):
+            state["cursor"] = min(max(0, len(items) - 1), state["cursor"] + body_h)
+        elif ch in (curses.KEY_PPAGE, 2):
+            state["cursor"] = max(0, state["cursor"] - body_h)
+        elif ch == ord("s"):
+            state["sort"] = "name" if state["sort"] == "recent" else "recent"
+        elif ch == ord("/"):
+            state["filter"] = _prompt(stdscr, "/")
+            state["cursor"] = 0
+            state["scroll"] = 0
+        elif ch == 27:  # Esc clears filter
+            if state["filter"]:
+                state["filter"] = ""
+                state["cursor"] = 0
+                state["scroll"] = 0
+        elif ch in (ord("\n"), curses.KEY_ENTER, ord("l")):
+            if items:
+                _suspend_shell(stdscr, str(items[state["cursor"]]["path"]))
+        elif ch == ord("!"):
+            if items:
+                _suspend_shell(stdscr, str(items[state["cursor"]]["path"]))
+        elif ch == ord("t"):
+            if items:
+                tag = _prompt(stdscr, "add tag: ")
+                if tag:
+                    p = items[state["cursor"]]
+                    changed = _tui_add_tag(p["path"], [tag])
+                    if changed:
+                        fresh = load_project(p["path"])
+                        for i, orig in enumerate(projects):
+                            if orig["path"] == p["path"]:
+                                projects[i] = fresh
+                                break
+                        state["message"] = f"tagged {p['name']}: {tag}"
+                    else:
+                        state["message"] = f"tag already present: {tag}"
+        elif ch == curses.KEY_RESIZE:
+            pass
+
+
+def run_tui():
+    if not sys.stdout.isatty():
+        print("proj: TUI requires an interactive terminal.", file=sys.stderr)
+        sys.exit(1)
+    projects = load_all_projects()
+    if not projects:
+        print("No projects found.")
+        return
+    curses.wrapper(_tui_main, projects)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="proj",
@@ -306,6 +628,8 @@ def main():
                       help="Show N most recently active projects")
     ls_p.add_argument("--verbose", "-v", action="store_true",
                       help="Show descriptions")
+    ls_p.add_argument("--interactive", "-i", action="store_true",
+                      help="Open interactive TUI browser")
 
     # show
     show_p = sub.add_parser("show", help="Show project details")
@@ -331,6 +655,8 @@ def main():
         cmd_tag(args)
     elif args.command == "tags":
         cmd_tags(args)
+    elif args.command is None and sys.stdout.isatty():
+        run_tui()
     else:
         parser.print_help()
 
